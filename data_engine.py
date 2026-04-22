@@ -10,7 +10,6 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from pandas.tseries.offsets import BDay
-from pandas_datareader import data as pdr
 
 from config import EQUITY_TICKERS, FRED_SERIES, LOOKBACK_WINDOW, VOL_INDEX_TICKERS
 
@@ -25,8 +24,13 @@ def _get_date_range(lookback_window: int = LOOKBACK_WINDOW) -> Tuple[pd.Timestam
 
 
 def _init_alpaca_client() -> Optional[StockHistoricalDataClient]:
-    api_key = st.secrets.get("ALPACA_API_KEY")
-    secret_key = st.secrets.get("ALPACA_SECRET_KEY")
+    try:
+        api_key = st.secrets.get("ALPACA_API_KEY")
+        secret_key = st.secrets.get("ALPACA_SECRET_KEY")
+    except Exception as exc:
+        logger.warning("Secrets Streamlit non disponibili (%s): fallback a yfinance.", exc)
+        return None
+
     if not api_key or not secret_key:
         logger.warning("Chiavi Alpaca mancanti: verra usato yfinance come fonte principale.")
         return None
@@ -69,10 +73,21 @@ def _fetch_yf_series(
     data = yf.download(symbol, start=start, end=end, auto_adjust=False, progress=False)
     if data.empty:
         raise RuntimeError(f"Nessun dato yfinance per {symbol}")
-    if "Adj Close" in data.columns:
-        series = data["Adj Close"].copy()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        price_field = "Adj Close" if "Adj Close" in data.columns.get_level_values(0) else "Close"
+        extracted = data.xs(price_field, axis=1, level=0)
+        if isinstance(extracted, pd.DataFrame):
+            series = extracted[symbol].copy() if symbol in extracted.columns else extracted.iloc[:, 0].copy()
+        else:
+            series = extracted.copy()
     else:
-        series = data["Close"].copy()
+        series = data["Adj Close"].copy() if "Adj Close" in data.columns else data["Close"].copy()
+
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+
+    series = pd.to_numeric(series, errors="coerce")
     series.name = symbol
     return series
 
@@ -122,33 +137,46 @@ def fetch_equity_data(lookback_window: int = LOOKBACK_WINDOW) -> pd.DataFrame:
     return prices
 
 
+def _fetch_fred_series(series_id: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    # FRED endpoint pubblico: evita dipendenze legacy incompatibili (pandas_datareader).
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    df = pd.read_csv(url, parse_dates=["DATE"])
+    if "DATE" not in df.columns or series_id not in df.columns:
+        raise RuntimeError(f"Formato FRED inatteso per {series_id}")
+    series = pd.to_numeric(df[series_id], errors="coerce")
+    out = pd.Series(series.values, index=pd.DatetimeIndex(df["DATE"]), name=series_id)
+    return out.sort_index().loc[start:end]
+
+
 @st.cache_data(ttl=3600, show_spinner=True)
-def fetch_macro_data(spy_index: pd.DatetimeIndex) -> pd.DataFrame:
-    if len(spy_index) == 0:
+def fetch_macro_data(_spy_index: pd.DatetimeIndex) -> pd.DataFrame:
+    if len(_spy_index) == 0:
         raise ValueError("Indice SPY vuoto")
-    start = spy_index[0] - BDay(5)
-    end = spy_index[-1] + BDay(1)
-    try:
-        macro = pdr.DataReader(FRED_SERIES, "fred", start, end)
-    except Exception as exc:
-        logger.error("Errore FRED: %s.", exc)
-        macro = pd.DataFrame(index=pd.date_range(start=start, end=end, freq="B"))
-        for s in FRED_SERIES:
+    start = _spy_index[0] - BDay(5)
+    end = _spy_index[-1] + BDay(1)
+
+    macro = pd.DataFrame(index=pd.date_range(start=start, end=end, freq="B"))
+    for s in FRED_SERIES:
+        try:
+            macro[s] = _fetch_fred_series(s, start, end)
+        except Exception as exc:
+            logger.error("Errore FRED per %s: %s.", s, exc)
             try:
                 macro[s] = _fetch_yf_series(s, start, end)
             except Exception as exc2:
                 logger.error("Fallback yfinance fallito per %s: %s.", s, exc2)
                 macro[s] = np.nan
-    macro = macro.sort_index().reindex(spy_index).ffill().shift(1)
+
+    macro = macro.sort_index().reindex(_spy_index).ffill().shift(1)
     return macro
 
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def fetch_vol_indices(spy_index: pd.DatetimeIndex) -> pd.DataFrame:
-    if len(spy_index) == 0:
+def fetch_vol_indices(_spy_index: pd.DatetimeIndex) -> pd.DataFrame:
+    if len(_spy_index) == 0:
         raise ValueError("Indice SPY vuoto")
-    start = spy_index[0] - BDay(5)
-    end = spy_index[-1] + BDay(1)
+    start = _spy_index[0] - BDay(5)
+    end = _spy_index[-1] + BDay(1)
     try:
         data = yf.download(VOL_INDEX_TICKERS, start=start, end=end, auto_adjust=False, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
@@ -157,13 +185,13 @@ def fetch_vol_indices(spy_index: pd.DatetimeIndex) -> pd.DataFrame:
     except Exception as exc:
         logger.error("Errore yfinance volatilita: %s.", exc)
         vol_df = pd.DataFrame(np.nan, index=pd.date_range(start=start, end=end, freq="B"), columns=VOL_INDEX_TICKERS)
-    return vol_df.sort_index().reindex(spy_index).ffill()
+    return vol_df.sort_index().reindex(_spy_index).ffill()
 
 
 @st.cache_data(ttl=3600, show_spinner=True)
 def load_all_data(lookback_window: int = LOOKBACK_WINDOW) -> Dict[str, pd.DataFrame]:
     prices = fetch_equity_data(lookback_window=lookback_window)
     spy_index = prices.index
-    macro = fetch_macro_data(spy_index=spy_index)
-    vol = fetch_vol_indices(spy_index=spy_index)
+    macro = fetch_macro_data(_spy_index=spy_index)
+    vol = fetch_vol_indices(_spy_index=spy_index)
     return {"prices": prices.ffill(), "macro": macro.ffill(), "vol": vol.ffill()}

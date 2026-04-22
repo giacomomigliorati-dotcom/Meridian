@@ -77,6 +77,7 @@ def main() -> None:
             logger.exception("Errore nel caricamento dati: %s", exc)
             st.error("Errore nel caricamento dei dati. Verifica log o chiavi API.")
             st.stop()
+            return
 
     with st.spinner("Calcolo feature quantitative..."):
         ctx = quant_features.build_quant_context(data["prices"], data["macro"], data["vol"])
