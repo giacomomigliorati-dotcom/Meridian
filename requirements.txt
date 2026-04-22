@@ -4,4 +4,5 @@ yfinance
 pandas
 numpy
 plotly
+matplotlib
 scikit-learn

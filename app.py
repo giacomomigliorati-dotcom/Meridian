@@ -179,10 +179,17 @@ def main() -> None:
     if not ratios_snap.empty:
         snap = ratios_snap.copy()
         snap["percentile"] = snap["percentile"] * 100.0
-        st.dataframe(
-            snap.style.background_gradient(cmap="RdYlGn", subset=["zscore"]).format({"value": "{:.3f}", "zscore": "{:.2f}", "percentile": "{:.1f}%"}),
-            use_container_width=True,
-        )
+        try:
+            styled_snap = snap.style.background_gradient(cmap="RdYlGn", subset=["zscore"]).format(
+                {"value": "{:.3f}", "zscore": "{:.2f}", "percentile": "{:.1f}%"}
+            )
+            st.dataframe(styled_snap, use_container_width=True)
+        except ImportError:
+            logger.warning("matplotlib non disponibile: visualizzazione heatmap senza gradiente.")
+            st.dataframe(
+                snap.style.format({"value": "{:.3f}", "zscore": "{:.2f}", "percentile": "{:.1f}%"}),
+                use_container_width=True,
+            )
     else:
         st.info("Heatmap non disponibile: dati insufficienti.")
 
